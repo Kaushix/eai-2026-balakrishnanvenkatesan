@@ -104,7 +104,7 @@ export const OUTPUT_PATH = path.join(PA1_ROOT, "out", "report.json");
  * properly. `TextDecoder` knows the label "windows-1257" — no dependency needed.
  */
 export function decodeOrderFile(bytes: Buffer): string {
-  throw new Error("TODO: decodeOrderFile is not implemented");
+  return new TextDecoder("windows-1257").decode(bytes);
 }
 
 /**
@@ -115,7 +115,11 @@ export function decodeOrderFile(bytes: Buffer): string {
  * that does not have one.
  */
 export function toIsoDate(ddmmyyyy: string): string {
-  throw new Error("TODO: toIsoDate is not implemented");
+  const parts = ddmmyyyy.trim().split(".");
+  const day = parts[0] ?? "";
+  const month = parts[1] ?? "";
+  const year = parts[2] ?? "";
+  return `${year}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`;
 }
 
 /**
@@ -127,7 +131,7 @@ export function toIsoDate(ddmmyyyy: string): string {
  * parseFloat, and a test checks exactly that.
  */
 export function toDecimalString(amount: string): string {
-  throw new Error("TODO: toDecimalString is not implemented");
+  return amount.trim().replace(",", ".");
 }
 
 /**
@@ -138,7 +142,19 @@ export function toDecimalString(amount: string): string {
  * header row.
  */
 export function parseCustomers(csv: string): Map<string, string> {
-  throw new Error("TODO: parseCustomers is not implemented");
+  const customers = new Map<string, string>();
+  const lines = csv.split(/\r?\n/);
+
+  for (let i = 1; i < lines.length; i++) {
+    const currentLine = lines[i] ?? "";
+    if (!currentLine.trim()) continue;
+    const [customerId, fullName] = currentLine.split(";");
+    if (customerId && fullName) {
+      customers.set(customerId.trim(), fullName.trim());
+    }
+  }
+
+  return customers;
 }
 
 // ------------------------------------------------------------------ ingest --
@@ -160,7 +176,61 @@ export function parseCustomers(csv: string): Map<string, string> {
  *     into `unmatchedCustomers`.
  */
 export function ingest(options: IngestOptions): Report {
-  throw new Error("TODO: ingest is not implemented");
+  const orderText = decodeOrderFile(readFileSync(options.ordersPath));
+  const lines = orderText.split(/\r?\n/);
+
+  if (lines.length && lines[lines.length - 1] === "") {
+    lines.pop();
+  }
+
+  const orders: Order[] = [];
+  const rejected: RejectedRecord[] = [];
+  const acceptedCustomerIds = new Set<string>();
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] ?? "";
+    const lineNumber = i + 1;
+
+    if (line.length !== ORDER_LINE_LENGTH) {
+      rejected.push({
+        line: lineNumber,
+        raw: line,
+        reason: `expected ${ORDER_LINE_LENGTH} characters, got ${line.length}`,
+      });
+      continue;
+    }
+
+    const field = (name: keyof typeof ORDER_LAYOUT): string => {
+      const [start, end] = ORDER_LAYOUT[name];
+      return line.slice(start, end).trim();
+    };
+
+    const order: Order = {
+      orderId: field("orderId"),
+      customerId: field("customerId"),
+      customerName: field("customerName"),
+      orderDate: toIsoDate(field("orderDate")),
+      amount: toDecimalString(field("amount")),
+      currency: field("currency"),
+    };
+
+    orders.push(order);
+    acceptedCustomerIds.add(order.customerId);
+  }
+
+  const customers = parseCustomers(
+    readFileSync(options.customersPath, "utf8")
+  );
+
+  const unmatchedCustomers = [...customers.keys()].filter(
+    (id) => !acceptedCustomerIds.has(id)
+  );
+
+  return {
+    orders,
+    rejected,
+    unmatchedCustomers,
+  };
 }
 
 // -------------------------------------------------------------------- main --
