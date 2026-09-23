@@ -40,7 +40,13 @@ async function connectWithRetry(): Promise<Channel> {
  * limit RabbitMQ will happily hand it every message in the queue at once.
  */
 export async function connectConsumerChannel(url: string, queueName: string): Promise<Channel> {
-  throw new Error("TODO: connectConsumerChannel is not implemented");
+  const connection = await amqplib.connect(url);
+  const channel = await connection.createChannel();
+
+  await channel.assertQueue(queueName, { durable: true });
+  await channel.prefetch(1);
+
+  return channel;
 }
 
 /**
@@ -54,7 +60,16 @@ export async function connectConsumerChannel(url: string, queueName: string): Pr
  * being silently dropped.
  */
 export async function handleMessage(channel: Channel, msg: ConsumeMessage): Promise<void> {
-  throw new Error("TODO: handleMessage is not implemented");
+  const correlationId = msg.properties.correlationId ?? "";
+  const payload = JSON.parse(msg.content.toString("utf8"));
+
+  appendFileSync(
+    OUTPUT_PATH,
+    `${JSON.stringify({ correlationId, receivedAt: new Date().toISOString(), payload })}\n`,
+    "utf8",
+  );
+
+  channel.ack(msg);
 }
 
 // -------------------------------------------------------------------- run --
