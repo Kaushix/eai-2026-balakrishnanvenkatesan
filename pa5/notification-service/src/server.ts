@@ -1,37 +1,124 @@
-/**
- * PA5 notification-service — EMPTY. Student implements everything below.
- *
- * Build:
- *   1. connectWithRetry(process.env.RABBITMQ_URL) from ../../shared/rabbit,
- *      then channel.prefetch(1).
- *   2. On startup, load /data/processed-ids.json (create it as `[]` if it
- *      does not exist yet — this file, and /data/notification.log, are
- *      bind-mounted so they survive `docker compose restart
- *      notification-service`; see ../../docs/adr-004.md for why this is a
- *      file and not an in-memory Set).
- *   3. channel.consume("notifications.queue", async (msg) => { ... }):
- *        - correlationId = msg.properties.headers?.correlationId
- *        - If correlationId is already in the processed-ids array: ack
- *          silently, log "duplicate skipped", do NOT touch
- *          notification.log. This is the idempotent-receiver requirement —
- *          the retry topology fans a retried message back out to every
- *          consumer queue (see ../../rabbitmq/definitions.json), so a
- *          notification you already logged WILL arrive again.
- *        - Otherwise: append one JSON line to /data/notification.log —
- *            {"correlationId":"...","orderId":"...","customerEmail":"...","timestamp":"...","message":"Order received"}
- *          (order is the canonical order from the message body — see
- *          ../../shared/canonical-order.ts for its shape), add
- *          correlationId to processed-ids and persist the array, ack, then
- *          publish a result event to results.notification with the same
- *          correlationId header.
- *   4. Same nack/retry/DLQ pattern as payment-service on any thrown error.
- *
- * The line below only keeps the container process alive so `docker compose
- * up --wait` succeeds against this untouched scaffold — delete it once your
- * own channel.consume(...) registration is what keeps the process alive.
- */
+import { appendFile, readFile, writeFile } from "node:fs/promises";
+import type { ConsumeMessage } from "amqplib";
 
-// import { connectWithRetry, getRetryCount } from "../../shared/rabbit";
+import { connectWithRetry, getRetryCount } from "../../shared/rabbit";
+import type { CanonicalOrder } from "../../shared/canonical-order";
 
-setInterval(() => {}, 1 << 30);
-console.log("[notification-service] scaffold running, no consumer implemented yet");
+const QUEUE = "notifications.queue";
+const RESULTS_EXCHANGE = "results.notification";
+const MAX_RETRIES = Number(process.env.MAX_RETRIES) || 3;
+const PROCESSED_IDS_FILE = "/data/processed-ids.json";
+const NOTIFICATION_LOG = "/data/notification.log";
+
+async function loadProcessedIds(): Promise<string[]> {
+  try {
+    const content = await readFile(PROCESSED_IDS_FILE, "utf8");
+    return JSON.parse(content) as string[];
+  } catch {
+    await writeFile(PROCESSED_IDS_FILE, "[]\n", "utf8");
+    return [];
+  }
+}
+
+async function saveProcessedIds(processedIds: string[]): Promise<void> {
+  await writeFile(
+    PROCESSED_IDS_FILE,
+    `${JSON.stringify(processedIds, null, 2)}\n`,
+    "utf8",
+  );
+}
+
+async function main(): Promise<void> {
+  const { channel } = await connectWithRetry(process.env.RABBITMQ_URL!);
+
+  await channel.prefetch(1);
+
+  const processedIds = await loadProcessedIds();
+
+  console.log(`[Notification] Consuming from ${QUEUE}`);
+
+  await channel.consume(QUEUE, async (msg: ConsumeMessage | null) => {
+    if (!msg) return;
+
+    const correlationId =
+      msg.properties.headers?.["correlationId"] as string | undefined;
+    const retryCount = getRetryCount(msg);
+
+    console.log(
+      `[Notification] Processing ${correlationId} (attempt ${retryCount + 1})`,
+    );
+
+    try {
+      if (!correlationId) {
+        throw new Error("Missing correlationId");
+      }
+
+      if (processedIds.includes(correlationId)) {
+        channel.ack(msg);
+        console.log(`[Notification] duplicate skipped: ${correlationId}`);
+        return;
+      }
+
+      const order = JSON.parse(msg.content.toString()) as CanonicalOrder;
+
+      const notification = {
+        correlationId,
+        orderId: order.orderId,
+        customerEmail: order.customer.email,
+        timestamp: new Date().toISOString(),
+        message: "Order received",
+      };
+
+      await appendFile(
+        NOTIFICATION_LOG,
+        `${JSON.stringify(notification)}\n`,
+        "utf8",
+      );
+
+      processedIds.push(correlationId);
+      await saveProcessedIds(processedIds);
+
+      channel.ack(msg);
+
+      channel.publish(
+        RESULTS_EXCHANGE,
+        "",
+        Buffer.from(
+          JSON.stringify({
+            correlationId,
+            source: "notification",
+            status: "success",
+            timestamp: new Date().toISOString(),
+            details: {
+              message: "Notification processed successfully",
+            },
+          }),
+        ),
+        {
+          headers: { correlationId },
+          contentType: "application/json",
+        },
+      );
+    } catch (err) {
+      if (retryCount >= MAX_RETRIES - 1) {
+        channel.publish(process.env.DLQ_EXCHANGE!, "", msg.content, {
+          headers: msg.properties.headers,
+        });
+
+        channel.ack(msg);
+
+        console.log(
+          `[Notification] -> DLQ after ${retryCount + 1} attempts: ${(err as Error).message}`,
+        );
+      } else {
+        channel.nack(msg, false, false);
+
+        console.log(
+          `[Notification] -> Retry (attempt ${retryCount + 1}): ${(err as Error).message}`,
+        );
+      }
+    }
+  });
+}
+
+main().catch(console.error);
