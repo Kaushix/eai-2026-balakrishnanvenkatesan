@@ -80,6 +80,7 @@ services:
       REQUEST_TIMEOUT_MS: ${REQUEST_TIMEOUT_MS:-2500}
     volumes:
       - ./orchestrator/data:/data
+      - ../canonical:/canonical:ro
     depends_on:
       payment:
         condition: service_healthy
